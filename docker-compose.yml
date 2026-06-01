@@ -1,0 +1,96 @@
+# =============================================================================
+# docker-compose.yml  (project root)
+#
+# Design decisions
+# ---------------------------------------
+# 1. Single service — api-service only.
+#    With vLLM running on RunPod serverless, openagent-infra no longer needs
+#    a local inference server. The model-downloader and vllm-service that
+#    were required for local GPU inference are gone. This file is now a
+#    single-service compose file running the FastAPI proxy only.
+#
+# 2. No volumes — model weights live on RunPod.
+#    The local weights named volume and all volume mounts are removed.
+#    There is nothing to download or mount locally.
+#
+# 3. No GPU dependency — the proxy has no CUDA requirement.
+#    The deploy.resources.reservations block with nvidia GPU access is
+#    removed entirely. api-service is a pure Python web application.
+#
+# 4. Port topology:
+#      User → openagent-frontend (:8000) → api-service (:8002) → RunPod vLLM endpoints
+#    api-service is the only service. It validates auth, injects reasoning
+#    effort, and proxies requests to the RunPod OpenAI-compatible endpoints.
+#    The RunPod endpoint URLs are set via PRIMARY_BASE_URL and ROUTER_BASE_URL in .env.
+#
+# 5. All secrets come from the root .env file.
+#    API_KEY, RUNPOD_API_KEY, PRIMARY_BASE_URL, ROUTER_BASE_URL, and REASONING_EFFORT
+#    are never hardcoded — always loaded via env_file.
+#
+# 6. System prompt — the OpenAgent persona is owned by openagent-frontend.
+#    It is sent as the first system message on every /chat request.
+#    openagent-infra never loads or stores a system prompt.
+#
+# 7. API key auth — api-service validates X-API-Key on every /chat
+#    request. It forwards to RunPod using RUNPOD_API_KEY as a Bearer
+#    token. These are two separate keys — one facing the caller,
+#    one facing RunPod.
+#
+# 8. REASONING_EFFORT — gpt-oss-120b and 20b support configurable reasoning effort.
+#    Default is medium. The proxy injects the effort level into the system
+#    message automatically. openagent-frontend or any tooling can override
+#    per request (low / medium / high).
+#
+# Note: the `version` field has been intentionally removed. Modern Docker
+# Compose treats it as obsolete and emits a warning without it.
+#
+# Usage (from project root)
+# -------------------------
+#   docker-compose build --no-cache
+#   docker-compose up -d api-service
+#
+# Then send requests:
+#   Invoke-WebRequest -Uri http://localhost:8002/health -UseBasicParsing
+#
+#   Invoke-WebRequest -Uri http://localhost:8002/chat `
+#     -Method POST `
+#     -ContentType "application/json" `
+#     -Headers @{"X-API-Key" = "your_api_key_here"} `
+#     -Body '{"messages": [{"role": "system", "content": "You are OpenAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}' `
+#     -UseBasicParsing
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # api-service
+  #
+  # Runs the FastAPI proxy on port 8002. The only service in openagent-infra.
+  #
+  # Responsibilities:
+  #   - Validates X-API-Key header on every /chat request (401 if invalid)
+  #   - Validates OpenAI messages format request body
+  #   - Injects reasoning_effort into the system message before forwarding
+  #   - Routes requests to primary or router model based on payload
+  #   - Forwards validated requests to RunPod via httpx async streaming
+  #     using RUNPOD_API_KEY as Authorization: Bearer header
+  #   - Streams SSE response back to the caller token by token
+  #   - /health checks both proxy status and both RunPod endpoints' reachability
+  #
+  # Port 8002 is the only externally exposed port in openagent-infra.
+  # Port 8000 is reserved for openagent-frontend.
+  # Topology: User → openagent-frontend (:8000) → api-service (:8002) → RunPod
+  #
+  # PRIMARY_BASE_URL and ROUTER_BASE_URL in .env must be set to your RunPod endpoints:
+  #   https://api.runpod.ai/v2/{endpoint-id}/openai/v1
+  # ---------------------------------------------------------------------------
+  api-service:
+    build:
+      context: .
+      dockerfile: docker/model/Dockerfile
+    image: openagent-infra:latest
+    env_file:
+      - .env
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    ports:
+      - "8002:8002"
