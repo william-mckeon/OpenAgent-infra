@@ -1,57 +1,60 @@
 # openagent-infra
 
-> **OpenAgent model inference infrastructure** — the resilient, dual-model serving layer of the OpenAgent OS ecosystem.
+> **OpenAgent model inference infrastructure** — the model serving proxy layer of the OpenAgent system.
 
 ---
 
 ## Overview
 
-`openagent-infra` is the inference proxy repository for **OpenAgent**. This repo is solely responsible for proxying requests to the underlying LLMs, authenticating callers, managing dual-model routing for unit economics, and streaming responses via a production-ready REST API.
+`openagent-infra` is the inference proxy repository for OpenAgent. This repo is solely responsible for proxying requests to external compute providers, authenticating callers, and streaming responses via a production-ready REST API.
 
-This repo is intentionally scoped to the model layer only. It has no knowledge of the frontend interfaces or business logic. Those concerns live in separate repositories. The boundary is clean by design: **openagent-infra serves the models, everything else builds on top of it.**
+This repo is intentionally scoped to the model layer only. It has no knowledge of the OpenAgent persona, the frontend, or the conversation state. Those concerns live in separate repositories. The boundary is clean by design: **openagent-infra proxies the models, everything else builds on top of it.**
 
-## The Dual-Model Strategy
+---
 
-OpenAgent's inference architecture relies on two models running in parallel on RunPod serverless to balance deep reasoning with low-latency control tasks:
+## The BYOC Strategy
 
-- **primary-120b** — built on **gpt-oss-120b**, the primary reasoning model handling complex analysis and deep conversations.
-- **router-20b** — built on **gpt-oss-20b**, the fast, lightweight control layer handling routing, history filtering, and agentic decisions.
+`openagent-infra` is designed to be fully model- and provider-agnostic using a **Bring Your Own Compute (BYOC)** strategy. It proxies requests to any OpenAI-compatible API endpoint (such as vLLM workers on RunPod, local Ollama instances, or standard commercial APIs). 
+
+It is designed to route between two logical models:
+
+- **base_model** — the primary reasoning model handling everyday conversations.
+- **nervous_system** — the fast, lightweight control layer handling routing, history filtering, and agent decisions.
 
 ---
 
 ## Where This Fits
 
 ```text
-OpenAgent Ecosystem
+openagent-os
 │
 ├── openagent-infra      ← YOU ARE HERE
-│   └── LLM inference API (port 8002)
+│   └── Model proxy API (port 8002)
 │       Open core — model proxy layer
 │
 ├── openagent-frontend   ← separate repo
-│   └── The user product experience (port 8000)
-│       Owns the system prompt, talks to openagent-infra
+│   └── The product experience (port 8000)
+│       Talks to openagent-api
 │
-├── openagent-training   ← future
-│   └── Fine-tuning and training pipelines
+├── openagent-api        ← separate repo
+│   └── The Identity Gateway (port 8001)
+│       Talks to openagent-infra
 │
-├── openagent-data       ← future
-│   └── Data collection and curation for training
-│
-└── openagent-auth       ← future
-    └── API key management and user signup
-
+└── openagent-logger     ← separate repo
+    └── The capture layer (port 8003)
 ```
+
+The naming convention is intentional:
+- `openagent-infra` handles the **model** connectivity and compute provision.
+- `openagent-*` (api, frontend, logger) handle the **product** — gateway, UI, identity, and state.
 
 **Port topology:**
-
 ```text
-User → openagent-frontend (:8000) → api-service (:8002) → RunPod primary-120b         [default]
-                                                        → RunPod router-20b           [model="router"]
-
+openagent-api (:8001) → openagent-infra (:8002) → BYOC Provider Base Model           [default]
+                                                → BYOC Provider Control Layer Model  [model="nervous_system"]
 ```
 
-`api-service` is the only service in `openagent-infra`. Both models run on separate RunPod serverless workers.
+openagent-infra is accessed exclusively by openagent-api. 
 
 ---
 
@@ -62,7 +65,7 @@ User → openagent-frontend (:8000) → api-service (:8002) → RunPod primary-1
 │              Docker Container                   │
 │                                                 │
 │  ┌───────────────────────────────────────────┐  │
-│  │         api-service  (port 8002)          │  │
+│  │         openagent-infra  (port 8002)      │  │
 │  │         FastAPI proxy — src/api/main.py   │  │
 │  │                                           │  │
 │  │  POST /chat  →  validates X-API-Key       │  │
@@ -70,52 +73,81 @@ User → openagent-frontend (:8000) → api-service (:8002) → RunPod primary-1
 │  │              →  routes by model field     │  │
 │  │              →  streams SSE to caller     │  │
 │  │  GET  /health → checks proxy + both       │  │
-│  │                 RunPod workers            │  │
+│  │                 compute endpoints         │  │
 │  │  Auth: X-API-Key header required on /chat │  │
 │  └──────────┬──────────────┬─────────────────┘  │
 └─────────────┼──────────────┼────────────────────┘
-              │ model="base" │ model="router"
+              │ model="base" │ model="nervous_system"
               │ (default)    │
               ▼              ▼
 ┌─────────────────────┐  ┌─────────────────────────┐
-│ RunPod vLLM Worker  │  │ RunPod vLLM Worker      │
-│ primary-120b        │  │ router-20b              │
-│ gpt-oss-120b/MXFP4  │  │ gpt-oss-20b/MXFP4       │
-│ Primary reasoning   │  │ Routing, history,       │
+│ BYOC Compute Prov.  │  │ BYOC Compute Prov.      │
+│ Base Model Endpoint │  │ Control Layer Endpoint  │
+│ e.g. vLLM / OpenAI  │  │ e.g. vLLM / OpenAI      │
+│ Primary agent model │  │ Routing, history,       │
 │ All /chat by default│  │ agent control layer     │
 └─────────────────────┘  └─────────────────────────┘
-
 ```
 
 ### Request flow
 
-1. `openagent-frontend` sends `POST /chat` with `X-API-Key`, messages list, optional `reasoning_effort`, and optional `model`.
-2. `api-service` validates the API key — returns `401` if missing or invalid.
-3. `api-service` injects `Reasoning: <level>` into the system message automatically.
-4. `api-service` routes to the correct RunPod worker — primary (120B) by default, router (20B) when `model="router"`.
-5. `api-service` forwards via httpx with `Authorization: Bearer RUNPOD_API_KEY`.
-6. RunPod generates tokens on dedicated GPU hardware.
-7. Tokens stream back through `api-service` to the caller as SSE events.
+1. `openagent-api` sends `POST /chat` with `X-API-Key`, messages list, optional `reasoning_effort`, and optional `model`.
+2. `openagent-infra` validates the API key — returns `401` if missing or invalid.
+3. `openagent-infra` injects `Reasoning: <level>` into the system message automatically.
+4. `openagent-infra` routes to the correct external endpoint — base model by default, control layer when `model="nervous_system"`.
+5. `openagent-infra` forwards via httpx with `Authorization: Bearer PROVIDER_API_KEY`.
+6. The BYOC provider generates tokens.
+7. Tokens stream back through `openagent-infra` to the caller as SSE events.
 8. A final `data: [DONE]` event signals end of stream.
 
 ### System prompt ownership
 
-The system prompt is owned by **openagent-frontend**, not `openagent-infra`. The frontend sends it as the first message in the OpenAI messages list on every request. `api-service` injects the reasoning effort level into it automatically before forwarding to RunPod. The infra layer never stores or inspects the system prompt content.
+The system prompt — the persona — is owned upstream by **openagent-api**. `openagent-api` sends it as the first message in the OpenAI messages list on every request. `openagent-infra` injects the reasoning effort level into it automatically before forwarding to the compute provider. `openagent-infra` never stores or inspects the system prompt content.
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-| --- | --- |
+|---|---|
 | Base image | `python:3.12-slim` |
-| Model serving | RunPod vLLM serverless — two independent workers |
-| primary-120b | gpt-oss-120b by OpenAI (`YourOrg/primary-120b-worker`) |
-| router-20b | gpt-oss-20b by OpenAI (`YourOrg/router-20b-worker`) |
-| Model precision | MXFP4 (MoE layers) — both models |
+| Model serving | BYOC — any OpenAI-compatible API endpoint |
 | API proxy | FastAPI + uvicorn |
-| Streaming | SSE via httpx async proxy from RunPod |
-| Auth | `X-API-Key` header (caller) + `RUNPOD_API_KEY` Bearer (RunPod) |
+| Streaming | SSE via httpx async proxy |
+| Auth | `X-API-Key` header (caller) + `PROVIDER_API_KEY` Bearer (Compute Provider) |
+| Containerization | Docker + Docker Compose |
+
+---
+
+## Prerequisites
+
+- **Docker Desktop** installed
+- **A Compute Provider** (e.g., RunPod, OpenAI, Local Ollama) serving two endpoints.
+- **PROVIDER_API_KEY** — An API key with access to both compute endpoints.
+- **API_KEY** — A secret key shared with `openagent-api` for request authentication.
+
+No local GPU required unless you are self-hosting your BYOC endpoints locally.
+
+---
+
+## Project Structure
+
+```text
+openagent-infra/
+├── docker/
+│   └── model/
+│       └── Dockerfile              # python:3.12-slim — proxy only, no CUDA
+├── src/
+│   └── api/
+│       └── main.py                 # FastAPI proxy — auth, routing, reasoning injection
+├── docker-compose.yml
+├── requirements.txt
+├── .env                            # secrets — never commit this
+├── .env.example                    # template for .env
+├── .dockerignore
+├── .gitignore
+└── README.md
+```
 
 ---
 
@@ -124,129 +156,52 @@ The system prompt is owned by **openagent-frontend**, not `openagent-infra`. The
 ### 1. Clone the repo
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/william-mckeon/openagent-infra.git
 cd openagent-infra
-
 ```
 
-### 2. Deploy RunPod workers
-
-Deploy two separate RunPod vLLM serverless endpoints — one per model. Set the following environment variables on each worker:
-
-**primary-120b worker:**
-
-| Variable | Value |
-| --- | --- |
-| `MODEL_NAME` | `YourOrg/primary-120b-worker` |
-| `HF_TOKEN` | Your HuggingFace token |
-| `MAX_MODEL_LEN` | `16384` |
-| `REASONING_PARSER` | `openai_gptoss` |
-| `ENFORCE_EAGER` | `true` |
-
-**router-20b worker:**
-
-| Variable | Value |
-| --- | --- |
-| `MODEL_NAME` | `YourOrg/router-20b-worker` |
-| `HF_TOKEN` | Your HuggingFace token |
-| `MAX_MODEL_LEN` | `16384` |
-| `REASONING_PARSER` | `openai_gptoss` |
-| `ENFORCE_EAGER` | `true` |
-
-Copy the endpoint ID from each worker at `https://www.runpod.io/console/serverless`.
-
-### 3. Create your `.env` file
+### 2. Create your `.env` file
 
 ```bash
 cp .env.example .env
-
 ```
 
 Edit `.env` and fill in your values:
 
 ```env
 API_KEY=your_long_random_secret_key_here
-PRIMARY_BASE_URL=[https://api.runpod.ai/v2/your_primary_endpoint_id_here/openai](https://api.runpod.ai/v2/your_primary_endpoint_id_here/openai)
-ROUTER_BASE_URL=[https://api.runpod.ai/v2/your_router_endpoint_id_here/openai](https://api.runpod.ai/v2/your_router_endpoint_id_here/openai)
-RUNPOD_API_KEY=your_runpod_api_key_here
+BASE_MODEL_URL=https://your-provider.com/v1/chat/completions
+NERVOUS_SYSTEM_URL=https://your-provider.com/v1/chat/completions
+PROVIDER_API_KEY=your_provider_api_key_here
 REASONING_EFFORT=medium
-
 ```
 
-### 4. Build and Start
+Generate a secure `API_KEY` with:
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 3. Build the image
 
 ```bash
-docker-compose up --build -d api-service
-
+docker-compose build --no-cache
 ```
 
----
+### 4. Start the API proxy
 
-## Design Decisions
-
-### Why dual-model routing?
-
-Using a 120B model for every API call destroys unit economics. By routing simple control tasks, history filtering, and agent decisions to a 20B model, we reduce VRAM requirements, lower latency, and drastically cut inference costs while preserving deep reasoning for the user-facing responses.
-
-### Why MXFP4?
-
-Both models utilize native MXFP4 quantization of the MoE layers. It reduces VRAM requirements significantly without quality degradation — the 120B fits on a single 80 GB GPU and the 20B fits within 16 GB.
-
-### Why RunPod serverless?
-
-RunPod serverless provides dedicated GPU hardware for both models, eliminates local GPU and CUDA requirements, scales each worker to zero when idle, and allows developers to focus on orchestration rather than bare-metal infrastructure.
-
-### Why two separate API keys?
-
-`API_KEY` authenticates the caller to the proxy. `RUNPOD_API_KEY` authenticates the proxy to the infrastructure backend. These concerns are deliberately separated to compartmentalize financial exposure. If the caller key is compromised, it can be rotated or revoked without altering the infrastructure configuration.
-
----
-
-## License
-
-Apache License 2.0
-Copyright 2026 William McKeon
-
+```bash
+docker-compose up -d
 ```
 
-***
+The API is ready when you see:
 
-### `DATASHEET.md`
-
-```markdown
-# openagent-infra — Datasheet
-
-> Reference document for building on top of openagent-infra.
-> Intended audience: **openagent-frontend** and any other service that consumes the OpenAgent inference API.
-
----
-
-## Quick Reference
-
-| Item | Value |
-|---|---|
-| Base URL | `http://localhost:8002` |
-| Protocol | HTTP/1.1 |
-| Streaming | Server-Sent Events (SSE) |
-| Auth | `X-API-Key` header (required on `/chat`) |
-| Content type in | `application/json` |
-| Content type out | `text/event-stream` |
-| Request format | OpenAI messages format |
-| Reasoning effort | `low` / `medium` / `high` (optional field, default: `medium`) |
-| Model selection | `base` (default) / `router` (optional field) |
-| Chat endpoint | `POST /chat` |
-| Health endpoint | `GET /health` |
-
----
-
-## Authentication
-
-Every `POST /chat` request must include a valid API key in the `X-API-Key` header. Requests with a missing or invalid key receive `401 Unauthorized`. 
-
-```http
-X-API-Key: your_api_key_here
-
+```text
+=== OpenAgent Inference API Ready — listening on :8002 ===
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8002
 ```
+
+Startup takes under 10 seconds — the proxy has no model to load.
 
 ---
 
@@ -254,122 +209,138 @@ X-API-Key: your_api_key_here
 
 ### `POST /chat`
 
-Sends a full OpenAI messages list to the proxy and receives a token-by-token streamed response via SSE. Optionally controls the reasoning effort level and model routing per request.
+Send a full OpenAI messages list and receive a streamed response via Server-Sent Events. Optionally set the reasoning effort level and model per request.
 
-#### Request
+Requires a valid `X-API-Key` header on every request.
 
+**Request headers:**
+```text
+Content-Type: application/json
+X-API-Key: your_api_key_here
+```
+
+**Request body:**
 ```json
 {
   "messages": [
-    {"role": "system",    "content": "You are a helpful OpenAgent..."},
-    {"role": "user",      "content": "Analyze the tradeoffs between SSE and WebSockets"}
+    {"role": "system",    "content": "You are OpenAgent..."},
+    {"role": "user",      "content": "hello"}
   ],
-  "reasoning_effort": "high",
+  "reasoning_effort": "medium",
   "model": "base"
 }
-
 ```
 
 | Field | Type | Required | Description |
-| --- | --- | --- | --- |
+|---|---|---|---|
 | `messages` | array | Yes | Full OpenAI messages list including system prompt |
-| `reasoning_effort` | string | No | `low`, `medium`, or `high`. Defaults to server `REASONING_EFFORT` env var. |
-| `model` | string | No | `base` (default) or `router`. Routes to primary (120B) or router (20B). |
+| `reasoning_effort` | string | No | `low`, `medium`, or `high`. Defaults to `medium`. |
+| `model` | string | No | `base` (default) or `nervous_system`. Routes to the base endpoint or the control layer endpoint. |
 
-**Important:** `openagent-frontend` is responsible for constructing the full messages list including the system prompt as the first `system` message. The proxy injects `Reasoning: <level>` into the system message automatically.
+**Error responses:**
+- `400` — messages list is empty or contains no user message
+- `401` — API key missing or invalid
+- `422` — request body malformed
+- `503` — Compute endpoint not reachable
 
-#### Reasoning effort guidance
-
-| Level | Latency | Use for |
-| --- | --- | --- |
-| `low` | Fastest | Lightweight tooling calls, simple lookups, routing decisions |
-| `medium` | Balanced | Standard interactions, general questions (default) |
-| `high` | Slowest | Complex analysis, multi-step reasoning, hard problems |
-
-#### Response
-
-```http
-HTTP/1.1 200 OK
-Content-Type: text/event-stream; charset=utf-8
-Cache-Control: no-cache
-Transfer-Encoding: chunked
-
+**curl:**
+```bash
+curl -X POST http://localhost:8002/chat      -H "Content-Type: application/json"      -H "X-API-Key: your_api_key_here"      -d '{"messages": [{"role": "system", "content": "You are OpenAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}'      --no-buffer
 ```
-
-Tokens are streamed as individual SSE events and always end with a `[DONE]` sentinel:
-
-```text
-data: Hello
-data: !
-data: [DONE]
-
-```
-
-#### Error responses
-
-| Status | Condition | Body |
-| --- | --- | --- |
-| `400` | Messages list is empty or contains no user message | `{"detail": "Messages list cannot be empty"}` |
-| `401` | X-API-Key header missing or invalid | `{"detail": "Invalid or missing API key"}` |
-| `422` | Request body malformed or missing | FastAPI validation error JSON |
-| `503` | RunPod endpoint not reachable | proxy error message |
 
 ---
 
 ### `GET /health`
 
-Lightweight health check. No authentication required. Checks both the proxy and the RunPod backend.
+Health check. No authentication required. Checks both the proxy and both compute endpoints independently.
 
 **Fully ready:**
-
 ```json
-{"status": "ok", "proxy": "ok", "primary": "ok", "router": "ok"}
-
+{"status": "ok", "proxy": "ok", "base_model": "ok", "nervous_system": "ok"}
 ```
 
-**Primary unreachable (Cold Start):**
-
+**base_model unreachable/cold-starting:**
 ```json
-{"status": "degraded", "proxy": "ok", "primary": "unreachable", "router": "ok"}
+{"status": "degraded", "proxy": "ok", "base_model": "unreachable", "nervous_system": "ok"}
+```
 
+**Nervous system not yet configured:**
+```json
+{"status": "ok", "proxy": "ok", "base_model": "ok", "nervous_system": "not configured"}
+```
+
+Status is `ok` when the base model is reachable — nervous-system is checked independently. `not configured` means `NERVOUS_SYSTEM_URL` is not set in `.env`.
+
+```bash
+curl http://localhost:8002/health
 ```
 
 ---
 
-## Technical Specifications
+### `GET /docs`
 
-### Startup timing
+Auto-generated Swagger UI:
 
-| Phase | Approximate duration |
-| --- | --- |
-| api-service startup | < 10 seconds |
-| RunPod worker cold start | 8–10 minutes (model loading) |
-| RunPod worker warm | < 2 seconds |
-
-Both workers scale to zero independently. Design frontends with loading states for both scenarios.
-
-### Generation timing
-
-| Scenario | Reasoning | Approximate duration |
-| --- | --- | --- |
-| Simple greeting | low | 5–15 seconds |
-| Short factual question | medium | 15–45 seconds |
-| Complex reasoning task | high | 1–3 minutes |
-
-RunPod continuous batching means concurrent requests do not queue — they are processed together.
+```text
+http://localhost:8002/docs
+```
 
 ---
 
-## Environment Variables Reference
+## Configuration
 
-| Variable | Type | Default | Description |
-| --- | --- | --- | --- |
-| `API_KEY` | string | — | Secret key validated against X-API-Key header. Required. |
-| `PRIMARY_BASE_URL` | string | — | RunPod endpoint for primary (120B). Required. |
-| `ROUTER_BASE_URL` | string | — | RunPod endpoint for router (20B). Required. |
-| `RUNPOD_API_KEY` | string | — | RunPod API key for Bearer auth on both endpoints. Required. |
-| `REASONING_EFFORT` | string | `medium` | Server default reasoning level. |
+| Variable | Default | Description |
+|---|---|---|
+| `API_KEY` | — | Secret key for X-API-Key auth (required) |
+| `BASE_MODEL_URL` | — | API endpoint for the primary model. Default for all requests (required) |
+| `NERVOUS_SYSTEM_URL` | — | API endpoint for the fast control model. Used when `model="nervous_system"` |
+| `PROVIDER_API_KEY` | — | API key for Bearer auth on both compute endpoints (required) |
+| `REASONING_EFFORT` | `medium` | Default reasoning level — `low`, `medium`, or `high` |
 
-```
+---
 
-```
+## Design Decisions
+
+### Why keep the FastAPI proxy layer instead of calling providers directly?
+
+Compute providers usually support only a single shared API key. By keeping FastAPI as a proxy, the auth validation lives in one place and can be cleanly swapped or managed without exposing the provider's billing API key to the gateway or frontend layers.
+
+### Why two separate API keys?
+
+`API_KEY` is the key `openagent-api` sends to `openagent-infra` — it identifies and authenticates the caller. `PROVIDER_API_KEY` is the key `openagent-infra` sends to the compute provider — it authenticates `openagent-infra` to the inference backend. These concerns are deliberately separated so the caller key can be rotated without affecting the provider configuration, and vice versa.
+
+### Why reasoning effort as an API parameter?
+
+Both models support configurable reasoning effort — low, medium, high. This is a genuine feature: frontends can expose it as Quick / Standard / Deep mode to users, and tooling can set it per use case programmatically. The proxy injects it into the system message automatically.
+
+### Why OpenAI messages format?
+
+The OpenAI messages format makes `openagent-infra` compatible with almost any frontend and model backend on the market. This keeps the serving layer stateless and the protocol standard.
+
+### Why port 8002?
+
+Port 8000 is reserved for openagent-frontend. Port 8001 is reserved for openagent-api. Port 8002 is the exposed port for openagent-infra.
+
+---
+
+## License
+
+Copyright © 2026 William McKeon.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+## Maintainer
+
+**William McKeon** ([github.com/william-mckeon](https://github.com/william-mckeon))
