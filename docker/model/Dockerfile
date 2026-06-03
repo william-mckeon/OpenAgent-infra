@@ -1,0 +1,173 @@
+# =============================================================================
+# docker/model/Dockerfile
+#
+# OpenAgent Inference Proxy Container
+#
+# Design decisions
+# ---------------------------------------
+# 1. python:3.12-slim base image — with both the base model and the
+#    nervous-system model running on external BYOC provider endpoints, this
+#    container only runs the FastAPI proxy layer (src/api/main.py). There is
+#    no local GPU, no model loading, no CUDA stack needed here. The image
+#    stays under 500 MB.
+#
+# 2. No CUDA, no PyTorch, no GPU-related dependencies — all inference happens
+#    at the provider. This container is a pure Python web application:
+#    FastAPI + uvicorn + httpx.
+#
+# 3. No volume mount — no model weights live here. Nothing to pull, nothing
+#    to mount.
+#
+# 4. No NVIDIA toolkit, no deploy.resources.reservations block needed in
+#    docker-compose.yml — this container has no GPU dependency.
+#
+# 5. All secrets (API_KEY, PROVIDER_API_KEY) and tuneable values
+#    (BASE_MODEL_URL, NERVOUS_SYSTEM_URL, REASONING_EFFORT) are passed via the
+#    root .env file — never hardcoded here.
+#
+# 6. This Dockerfile serves one service in docker-compose.yml:
+#      openagent-infra — runs the FastAPI proxy on port 8002.
+#    The proxy validates X-API-Key auth, injects reasoning_effort into the
+#    system message, routes to the correct provider endpoint based on the
+#    optional model field, and streams the SSE response back.
+#
+# 7. Port topology:
+#      openagent-api (:8001) → openagent-infra (:8002) → BYOC base model           [default]
+#                                                       → BYOC nervous-system model [model="nervous_system"]
+#    openagent-infra is the only service in this repo. Both models run on
+#    external provider endpoints — no inference happens here.
+#
+# Build (from project root)
+# -------------------------
+#   docker build -f docker/model/Dockerfile -t openagent-infra:latest .
+#
+# Run via docker-compose (recommended — see docker-compose.yml at root)
+#   docker-compose up openagent-infra
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Base image — python:3.12-slim
+#
+# Minimal Debian-based Python 3.12 image. No CUDA, no PyTorch, no GPU tooling —
+# none of that is needed here. The proxy is a pure async Python web app.
+# Pinned to 3.12-slim for reproducibility.
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim
+
+
+# -----------------------------------------------------------------------------
+# Labels — human-readable metadata, visible via `docker inspect`
+# -----------------------------------------------------------------------------
+LABEL maintainer="William McKeon"
+LABEL description="OpenAgent inference proxy — routes requests to the base and nervous-system models on a BYOC provider"
+
+
+# -----------------------------------------------------------------------------
+# Environment — system level
+#
+# PYTHONUNBUFFERED=1
+#   Disables Python output buffering so every log line appears in
+#   docker-compose logs immediately. Critical for streaming proxy visibility.
+#
+# PYTHONDONTWRITEBYTECODE=1
+#   Stops Python writing .pyc files inside the container.
+#
+# PIP_NO_CACHE_DIR=1
+#   Prevents pip storing its download cache inside the image layer.
+#
+# DEBIAN_FRONTEND=noninteractive
+#   Suppresses apt interactive prompts during build.
+# -----------------------------------------------------------------------------
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+
+# -----------------------------------------------------------------------------
+# Environment — application level defaults
+#
+# These match the os.environ.get() calls in src/api/main.py exactly.
+# All are overridable via the root .env file without rebuilding the image.
+# Empty-string defaults here — all required values must be set in .env.
+#
+# API_KEY
+#   Secret validated against the X-API-Key header on every /chat request.
+#   The same value openagent-api holds as INFRA_API_KEY. Required.
+#
+# BASE_MODEL_URL
+#   Full OpenAI-compatible chat-completions endpoint for the base model.
+#   Default route for all /chat requests. Required.
+#   e.g. https://your-provider.com/v1/chat/completions
+#
+# NERVOUS_SYSTEM_URL
+#   Full OpenAI-compatible chat-completions endpoint for the nervous-system
+#   (control-layer) model. Used when model="nervous_system" is passed.
+#   Optional — without it, model="nervous_system" requests fail gracefully and
+#   the pipeline is unbroken (omitting the model field always routes to base).
+#
+# PROVIDER_API_KEY
+#   Sent as Authorization: Bearer on every forwarded request to the provider
+#   endpoint(s). Separate from API_KEY, which faces the caller — this key
+#   faces the provider. Never exposed to any caller. Required.
+#
+# REASONING_EFFORT
+#   Default reasoning effort applied to both models if not set per request.
+#   low | medium (default) | high. Overridable per request.
+# -----------------------------------------------------------------------------
+ENV API_KEY="" \
+    BASE_MODEL_URL="" \
+    NERVOUS_SYSTEM_URL="" \
+    PROVIDER_API_KEY="" \
+    REASONING_EFFORT="medium"
+
+
+# -----------------------------------------------------------------------------
+# Working directory
+# -----------------------------------------------------------------------------
+WORKDIR /app
+
+
+# -----------------------------------------------------------------------------
+# Python dependencies
+#
+# requirements.txt is copied before src/ so Docker can cache this layer.
+# A code-only change will not re-run pip install.
+#
+# Packages installed:
+#   fastapi        — web framework for the proxy API
+#   uvicorn        — ASGI server that runs the FastAPI app
+#   httpx          — async HTTP client for forwarding to the provider
+#   python-dotenv  — loads .env for local (non-Docker) development
+#
+# No torch, transformers, accelerate, or any GPU/ML libraries — all inference
+# runs at the provider.
+# -----------------------------------------------------------------------------
+COPY requirements.txt ./
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+
+# -----------------------------------------------------------------------------
+# Application source code
+#
+# Only src/ is needed at runtime. Project files (README, .env.example,
+# .gitignore, etc.) are excluded via .dockerignore at project root.
+# -----------------------------------------------------------------------------
+COPY src/ ./src/
+
+
+# -----------------------------------------------------------------------------
+# Default command
+#
+# Runs the FastAPI proxy via uvicorn on port 8002. The only service this
+# image runs. The proxy:
+#   - Validates X-API-Key on every /chat request
+#   - Injects Reasoning: <level> into the system message
+#   - Routes to BASE_MODEL_URL (default) or NERVOUS_SYSTEM_URL based on the
+#     optional model field in the request body
+#   - Streams the SSE response back to the caller
+#   - Probes both provider endpoints on GET /health
+# -----------------------------------------------------------------------------
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8002"]
