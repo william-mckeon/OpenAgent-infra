@@ -6,20 +6,22 @@
 
 ## Overview
 
-`openagent-infra` is the inference proxy repository for OpenAgent. This repo is solely responsible for proxying requests to external compute providers, authenticating callers, and streaming responses via a production-ready REST API.
+`openagent-infra` is the inference proxy for OpenAgent. This repo is solely responsible for proxying requests to external compute providers, authenticating callers, and streaming responses via a small, production-shaped REST API.
 
-This repo is intentionally scoped to the model layer only. It has no knowledge of the OpenAgent persona, the frontend, or the conversation state. Those concerns live in separate repositories. The boundary is clean by design: **openagent-infra proxies the models, everything else builds on top of it.**
+It is intentionally scoped to the model layer only. It has no knowledge of the OpenAgent persona, the frontend, or the conversation state — those live in separate repos. The boundary is clean by design: **openagent-infra proxies the models, everything else builds on top of it.**
 
 ---
 
-## The BYOC Strategy
+## The BYOC strategy
 
-`openagent-infra` is designed to be fully model- and provider-agnostic using a **Bring Your Own Compute (BYOC)** strategy. It proxies requests to any OpenAI-compatible API endpoint (such as vLLM workers on RunPod, local Ollama instances, or standard commercial APIs). 
+`openagent-infra` is deliberately model- and provider-agnostic, built around a **Bring Your Own Compute (BYOC)** approach. It proxies requests to any OpenAI-compatible API endpoint — vLLM workers on RunPod, a local Ollama instance, a standard commercial API, whatever you point it at.
 
-It is designed to route between two logical models:
+It routes between two logical models:
 
 - **base_model** — the primary reasoning model handling everyday conversations.
 - **nervous_system** — the fast, lightweight control layer handling routing, history filtering, and agent decisions.
+
+Keeping the proxy provider-agnostic means the rest of the stack never has to care where inference actually happens; you can swap providers or model sizes by changing two URLs and a key.
 
 ---
 
@@ -30,7 +32,7 @@ openagent-os
 │
 ├── openagent-infra      ← YOU ARE HERE
 │   └── Model proxy API (port 8002)
-│       Open core — model proxy layer
+│       Model proxy layer
 │
 ├── openagent-frontend   ← separate repo
 │   └── The product experience (port 8000)
@@ -54,7 +56,7 @@ openagent-api (:8001) → openagent-infra (:8002) → BYOC Provider Base Model  
                                                 → BYOC Provider Control Layer Model  [model="nervous_system"]
 ```
 
-openagent-infra is accessed exclusively by openagent-api. 
+openagent-infra is accessed exclusively by openagent-api.
 
 ---
 
@@ -122,9 +124,9 @@ The system prompt — the persona — is owned upstream by **openagent-api**. `o
 ## Prerequisites
 
 - **Docker Desktop** installed
-- **A Compute Provider** (e.g., RunPod, OpenAI, Local Ollama) serving two endpoints.
-- **PROVIDER_API_KEY** — An API key with access to both compute endpoints.
-- **API_KEY** — A secret key shared with `openagent-api` for request authentication.
+- **A compute provider** (e.g., RunPod, OpenAI, local Ollama) serving two endpoints.
+- **PROVIDER_API_KEY** — an API key with access to both compute endpoints.
+- **API_KEY** — a secret key shared with `openagent-api` for request authentication.
 
 No local GPU required unless you are self-hosting your BYOC endpoints locally.
 
@@ -241,11 +243,15 @@ X-API-Key: your_api_key_here
 - `400` — messages list is empty or contains no user message
 - `401` — API key missing or invalid
 - `422` — request body malformed
-- `503` — Compute endpoint not reachable
+- `503` — compute endpoint not reachable
 
 **curl:**
 ```bash
-curl -X POST http://localhost:8002/chat      -H "Content-Type: application/json"      -H "X-API-Key: your_api_key_here"      -d '{"messages": [{"role": "system", "content": "You are OpenAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}'      --no-buffer
+curl -X POST http://localhost:8002/chat \
+     -H "Content-Type: application/json" \
+     -H "X-API-Key: your_api_key_here" \
+     -d '{"messages": [{"role": "system", "content": "You are OpenAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}' \
+     --no-buffer
 ```
 
 ---
@@ -259,7 +265,7 @@ Health check. No authentication required. Checks both the proxy and both compute
 {"status": "ok", "proxy": "ok", "base_model": "ok", "nervous_system": "ok"}
 ```
 
-**base_model unreachable/cold-starting:**
+**base_model unreachable / cold-starting:**
 ```json
 {"status": "degraded", "proxy": "ok", "base_model": "unreachable", "nervous_system": "ok"}
 ```
@@ -303,7 +309,7 @@ http://localhost:8002/docs
 
 ### Why keep the FastAPI proxy layer instead of calling providers directly?
 
-Compute providers usually support only a single shared API key. By keeping FastAPI as a proxy, the auth validation lives in one place and can be cleanly swapped or managed without exposing the provider's billing API key to the gateway or frontend layers.
+Compute providers usually support only a single shared API key. By keeping FastAPI as a proxy, auth validation lives in one place and can be swapped or managed without exposing the provider's billing API key to the gateway or frontend layers.
 
 ### Why two separate API keys?
 
@@ -311,11 +317,11 @@ Compute providers usually support only a single shared API key. By keeping FastA
 
 ### Why reasoning effort as an API parameter?
 
-Both models support configurable reasoning effort — low, medium, high. This is a genuine feature: frontends can expose it as Quick / Standard / Deep mode to users, and tooling can set it per use case programmatically. The proxy injects it into the system message automatically.
+Both models support configurable reasoning effort — low, medium, high. It's a genuine feature: a frontend can expose it as Quick / Standard / Deep mode, and tooling can set it per use case programmatically. The proxy injects it into the system message automatically.
 
 ### Why OpenAI messages format?
 
-The OpenAI messages format makes `openagent-infra` compatible with almost any frontend and model backend on the market. This keeps the serving layer stateless and the protocol standard.
+The OpenAI messages format makes `openagent-infra` compatible with almost any frontend and model backend on the market. It keeps the serving layer stateless and the protocol standard.
 
 ### Why port 8002?
 
@@ -331,7 +337,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+```text
+http://www.apache.org/licenses/LICENSE-2.0
+```
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
