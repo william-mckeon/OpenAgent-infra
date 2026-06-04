@@ -1,76 +1,12 @@
 # =============================================================================
 # requirements.txt  (project root)
 #
-# Packages for the FastAPI proxy layer only — src/api/main.py.
-#
-# Architecture context
-# -------------------------------------------------------------------------
-# alpha-infra uses two separate containers with two separate dependency sets:
-#
-#   alpha-infra:latest  (this file)
-#   Built from docker/model/Dockerfile — python:3.12-slim
-#   Runs the FastAPI proxy only. No GPU, no model loading, no inference.
-#   Only the five packages below are needed.
-#
-#   alpha-mirror:latest  (scripts/ container)
-#   Built from scripts/Dockerfile — python:3.12-slim
-#   Runs mirror_alpha_base.py and mirror_nervous_system.py only.
-#   Has its own dependency: huggingface_hub
-#   See scripts/Dockerfile for that container's pip install.
-#
-# huggingface_hub is intentionally absent from this file.
-# It belongs only in the scripts/ mirror container. The proxy never
-# downloads, loads, or interacts with model weights directly — all
-# inference runs on RunPod via ALPHA_BASE_URL and NERVOUS_SYSTEM_URL.
-#
-# The inference stack (torch, transformers, vllm, accelerate,
-# bitsandbytes) is also absent. vLLM runs on RunPod serverless workers.
-# Neither alpha-base (gpt-oss-120b) nor alpha-nervous-system (gpt-oss-20b)
-# are loaded locally — the proxy only forwards HTTP requests and streams
-# SSE responses back to the caller.
-#
-# Packages
-# -------------------------------------------------------------------------
-#
-# fastapi
-#   Web framework for src/api/main.py. Provides the FastAPI app,
-#   HTTPException, Security, APIKeyHeader, StreamingResponse, and Pydantic
-#   request validation for the ChatRequest and Message models. Handles
-#   X-API-Key authentication, request body validation, and the /chat and
-#   /health endpoint definitions.
-#
-# uvicorn
-#   ASGI server that runs the FastAPI proxy. Started via:
-#     uvicorn src.api.main:app --host 0.0.0.0 --port 8002
-#   This is the only publicly exposed port in alpha-infra.
-#
-# sse-starlette
-#   Server-Sent Events support for Starlette / FastAPI. Used in
-#   src/api/main.py to stream SSE chunks back to the caller via
-#   StreamingResponse with media_type="text/event-stream". Required
-#   for the token-by-token streaming pattern from RunPod through the
-#   proxy to arcus-frontend.
-#
-# httpx
-#   Async HTTP client used in proxy_stream() to forward POST /chat
-#   requests to the correct RunPod endpoint — ALPHA_BASE_URL for
-#   alpha-base (120B) or NERVOUS_SYSTEM_URL for alpha-nervous-system
-#   (20B) — and to GET both health endpoints in the /health check.
-#   Used instead of aiohttp for its native async streaming support
-#   which is required for the SSE proxy pattern. Timeout set to 600s
-#   for long-running high-effort reasoning requests.
-#
-# openai-harmony
-#   Harmony response format support for the gpt-oss model family.
-#   Both alpha-base (gpt-oss-120b) and alpha-nervous-system (gpt-oss-20b)
-#   were trained on the harmony format and must only be used with it.
-#   The RunPod vLLM worker applies REASONING_PARSER=openai_gptoss to
-#   separate delta.reasoning and delta.content in the SSE stream. This
-#   package ensures correct harmony format handling at the proxy layer.
+# openagent-infra is a pure-Python async proxy. No GPU/ML libraries —
+# no torch, transformers, accelerate, or CUDA tooling — all inference runs
+# at the BYOC provider. Pinned to compatible ranges.
 # =============================================================================
 
-fastapi
-uvicorn
-sse-starlette
-httpx
-openai-harmony
+fastapi>=0.110,<1.0          # web framework for the proxy API (bundles pydantic)
+uvicorn[standard]>=0.29,<1.0 # ASGI server that runs the FastAPI app
+httpx>=0.27,<1.0             # async HTTP client for streaming to the provider
+python-dotenv>=1.0,<2.0      # loads .env for local (non-Docker) development

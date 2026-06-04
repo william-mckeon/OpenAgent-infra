@@ -1,0 +1,77 @@
+# =============================================================================
+# .dockerignore  (project root)
+#
+# Prevents files from being sent to the Docker build context.
+# Keeps the build fast and ensures secrets never end up inside the image.
+#
+# The build context for openagent-infra is tiny — only src/ and
+# requirements.txt are needed at runtime. Everything else is excluded.
+#
+# Rule of thumb: if it is in .gitignore it should also be here.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Secrets — most important rule: .env must never enter the image.
+# The image inherits values at runtime via docker-compose env_file, not COPY.
+# API_KEY, BASE_MODEL_URL, NERVOUS_SYSTEM_URL, and PROVIDER_API_KEY are all
+# passed in at runtime — never baked into the image layer.
+# -----------------------------------------------------------------------------
+.env
+
+# -----------------------------------------------------------------------------
+# Model weights — defensive exclusion.
+# No weights live here — inference runs at the provider — but this keeps any
+# accidental local /models/ directory out of the build context.
+# -----------------------------------------------------------------------------
+/models/
+
+# -----------------------------------------------------------------------------
+# Python cache and build artifacts
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# -----------------------------------------------------------------------------
+# Jupyter notebook files
+# -----------------------------------------------------------------------------
+*.ipynb
+.ipynb_checkpoints/
+
+# -----------------------------------------------------------------------------
+# Version control
+# -----------------------------------------------------------------------------
+.git/
+.gitignore
+
+# -----------------------------------------------------------------------------
+# Local development and editor files
+# -----------------------------------------------------------------------------
+.env.example
+README.md
+docs/
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# -----------------------------------------------------------------------------
+# Docker files — no need to include these in the build context
+# -----------------------------------------------------------------------------
+docker-compose.yml
+docker/
+
+# -----------------------------------------------------------------------------
+# Test and CI artifacts
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
