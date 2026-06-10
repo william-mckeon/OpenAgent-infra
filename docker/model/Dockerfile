@@ -5,11 +5,11 @@
 #
 # Design decisions
 # ---------------------------------------
-# 1. python:3.12-slim base image — with both the base model and the
-#    nervous-system model running on external BYOC provider endpoints, this
-#    container only runs the FastAPI proxy layer (src/api/main.py). There is
-#    no local GPU, no model loading, no CUDA stack needed here. The image
-#    stays under 500 MB.
+# 1. python:3.12-slim base image — with the base model, the nervous-system
+#    model, and the embedding model all running on external BYOC provider
+#    endpoints, this container only runs the FastAPI proxy layer
+#    (src/api/main.py). There is no local GPU, no model loading, no CUDA stack
+#    needed here. The image stays under 500 MB.
 #
 # 2. No CUDA, no PyTorch, no GPU-related dependencies — all inference happens
 #    at the provider. This container is a pure Python web application:
@@ -22,20 +22,27 @@
 #    docker-compose.yml — this container has no GPU dependency.
 #
 # 5. All secrets (API_KEY, PROVIDER_API_KEY) and tuneable values
-#    (BASE_MODEL_URL, NERVOUS_SYSTEM_URL, REASONING_EFFORT) are passed via the
-#    root .env file — never hardcoded here.
+#    (BASE_MODEL_URL, NERVOUS_SYSTEM_URL, EMBEDDING_MODEL_URL, REASONING_EFFORT,
+#    and the optional BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME /
+#    EMBEDDING_MODEL_NAME) are passed via the root .env file — never hardcoded
+#    here.
 #
 # 6. This Dockerfile serves one service in docker-compose.yml:
 #      openagent-infra — runs the FastAPI proxy on port 8002.
-#    The proxy validates X-API-Key auth, injects reasoning_effort into the
-#    system message, routes to the correct provider endpoint based on the
-#    optional model field, and streams the SSE response back.
+#    The proxy validates X-API-Key auth on every request. On /chat it injects
+#    reasoning_effort into the system message, routes to the correct provider
+#    endpoint based on the optional model field, and streams the SSE response
+#    back. On /embed it forwards the input to the embedding model and returns
+#    the provider's JSON response (no streaming).
 #
 # 7. Port topology:
-#      openagent-api (:8001) → openagent-infra (:8002) → BYOC base model           [default]
-#                                                       → BYOC nervous-system model [model="nervous_system"]
-#    openagent-infra is the only service in this repo. Both models run on
-#    external provider endpoints — no inference happens here.
+#      openagent-api (:8001) → openagent-infra (:8002) → BYOC base model           [/chat, default]
+#                                                       → BYOC nervous-system model [/chat, model="nervous_system"]
+#                                                       → BYOC embedding model      [/embed]
+#    openagent-infra is the only service in this repo. All models run on
+#    external provider endpoints — no inference happens here. api is the
+#    primary caller today; other server-side services may call the proxy as
+#    the system grows.
 #
 # Build (from project root)
 # -------------------------
@@ -60,7 +67,7 @@ FROM python:3.12-slim
 # Labels — human-readable metadata, visible via `docker inspect`
 # -----------------------------------------------------------------------------
 LABEL maintainer="William McKeon"
-LABEL description="OpenAgent inference proxy — routes requests to the base and nervous-system models on a BYOC provider"
+LABEL description="OpenAgent inference proxy — routes requests to the base, nervous-system, and embedding models on a BYOC provider"
 
 
 # -----------------------------------------------------------------------------
@@ -93,19 +100,27 @@ ENV PYTHONUNBUFFERED=1 \
 # Empty-string defaults here — all required values must be set in .env.
 #
 # API_KEY
-#   Secret validated against the X-API-Key header on every /chat request.
-#   The same value openagent-api holds as INFRA_API_KEY. Required.
+#   Secret validated against the X-API-Key header on every /chat and /embed
+#   request. The same value openagent-api holds as INFRA_API_KEY. Required.
 #
 # BASE_MODEL_URL
-#   Full OpenAI-compatible chat-completions endpoint for the base model.
-#   Default route for all /chat requests. Required.
-#   e.g. https://your-provider.com/v1/chat/completions
+#   OpenAI-compatible BASE endpoint for the base model — the provider root,
+#   WITHOUT the chat-completions path. The proxy appends /v1/chat/completions
+#   when forwarding. Default route for all /chat requests. Required.
+#   e.g. https://your-provider.com/openai
 #
 # NERVOUS_SYSTEM_URL
-#   Full OpenAI-compatible chat-completions endpoint for the nervous-system
-#   (control-layer) model. Used when model="nervous_system" is passed.
+#   OpenAI-compatible BASE endpoint for the nervous-system (control-layer)
+#   model — same base form as BASE_MODEL_URL (no /v1/chat/completions; the
+#   proxy appends it). Used when model="nervous_system" is passed.
 #   Optional — without it, model="nervous_system" requests fail gracefully and
 #   the pipeline is unbroken (omitting the model field always routes to base).
+#
+# EMBEDDING_MODEL_URL
+#   OpenAI-compatible BASE endpoint for the embedding model — same base form
+#   as BASE_MODEL_URL (no path; the proxy appends /v1/embeddings). Used by
+#   POST /embed. Optional — without it, /embed returns a clear "not configured"
+#   error and /chat is entirely unaffected.
 #
 # PROVIDER_API_KEY
 #   Sent as Authorization: Bearer on every forwarded request to the provider
@@ -113,14 +128,27 @@ ENV PYTHONUNBUFFERED=1 \
 #   faces the provider. Never exposed to any caller. Required.
 #
 # REASONING_EFFORT
-#   Default reasoning effort applied to both models if not set per request.
+#   Default reasoning effort applied to both chat models if not set per request
+#   (the embedding model does not reason).
 #   low | medium (default) | high. Overridable per request.
+#
+# BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME / EMBEDDING_MODEL_NAME
+#   Optional model name per route. When set, the proxy adds "model": <name> to
+#   that route's forwarded payload; when empty, no model field is sent (the
+#   default). Required by providers that demand an explicit model field — e.g.
+#   a BGE-M3 embedding worker returns 500 without it (set EMBEDDING_MODEL_NAME=
+#   BAAI/bge-m3). Routing is by URL regardless; these only shape the payload.
+#   All empty by default; real values come from .env.
 # -----------------------------------------------------------------------------
 ENV API_KEY="" \
     BASE_MODEL_URL="" \
     NERVOUS_SYSTEM_URL="" \
+    EMBEDDING_MODEL_URL="" \
     PROVIDER_API_KEY="" \
-    REASONING_EFFORT="medium"
+    REASONING_EFFORT="medium" \
+    BASE_MODEL_NAME="" \
+    NERVOUS_SYSTEM_MODEL_NAME="" \
+    EMBEDDING_MODEL_NAME=""
 
 
 # -----------------------------------------------------------------------------
@@ -163,11 +191,13 @@ COPY src/ ./src/
 #
 # Runs the FastAPI proxy via uvicorn on port 8002. The only service this
 # image runs. The proxy:
-#   - Validates X-API-Key on every /chat request
-#   - Injects Reasoning: <level> into the system message
-#   - Routes to BASE_MODEL_URL (default) or NERVOUS_SYSTEM_URL based on the
-#     optional model field in the request body
-#   - Streams the SSE response back to the caller
-#   - Probes both provider endpoints on GET /health
+#   - Validates X-API-Key on every /chat and /embed request
+#   - /chat  : injects Reasoning: <level> into the system message, routes to
+#              BASE_MODEL_URL (default) or NERVOUS_SYSTEM_URL based on the
+#              optional model field, and streams the SSE response back
+#   - /embed : forwards the input to EMBEDDING_MODEL_URL and returns the
+#              provider's JSON embeddings response (no streaming)
+#   - Probes all three provider endpoints (base, nervous-system, embedding)
+#     on GET /health
 # -----------------------------------------------------------------------------
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8002"]

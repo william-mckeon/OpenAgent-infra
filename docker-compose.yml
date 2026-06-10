@@ -16,29 +16,37 @@
 #    web application.
 #
 # 4. Port topology:
-#      openagent-api (:8001) → openagent-infra (:8002) → BYOC provider endpoint
-#    openagent-infra is the only service. It validates auth, injects reasoning
-#    effort, routes by the optional model field, and proxies to the provider's
-#    OpenAI-compatible endpoint(s). Endpoint URLs are set via BASE_MODEL_URL
-#    (and optionally NERVOUS_SYSTEM_URL) in .env.
+#      openagent-api (:8001) → openagent-infra (:8002) → BYOC base model           [/chat, default]
+#                                                       → BYOC nervous-system model [/chat, model="nervous_system"]
+#                                                       → BYOC embedding model      [/embed]
+#    openagent-infra is the only service. It validates auth on every request;
+#    on /chat it injects reasoning effort and routes by the optional model
+#    field, on /embed it forwards input to the embedding model — then proxies
+#    to the provider's OpenAI-compatible endpoint(s). Endpoint URLs are set via
+#    BASE_MODEL_URL (and optionally NERVOUS_SYSTEM_URL and EMBEDDING_MODEL_URL)
+#    in .env. api is the primary caller today; other server-side services may
+#    call the proxy as the system grows.
 #
 # 5. All secrets come from the root .env file.
-#    API_KEY, PROVIDER_API_KEY, BASE_MODEL_URL, NERVOUS_SYSTEM_URL, and
-#    REASONING_EFFORT are never hardcoded — always loaded via env_file.
+#    API_KEY, PROVIDER_API_KEY, BASE_MODEL_URL, NERVOUS_SYSTEM_URL,
+#    EMBEDDING_MODEL_URL, REASONING_EFFORT, and the optional model-name vars
+#    (BASE_MODEL_NAME, NERVOUS_SYSTEM_MODEL_NAME, EMBEDDING_MODEL_NAME) are
+#    never hardcoded — always loaded via env_file.
 #
 # 6. System prompt — the persona is owned by openagent-api.
 #    openagent-api sends it as the first system message on every /chat request.
-#    openagent-infra never loads or stores a system prompt.
+#    openagent-infra never loads or stores a system prompt. (Embeddings carry
+#    no persona — /embed forwards raw input only.)
 #
-# 7. API key auth — openagent-infra validates X-API-Key on every /chat request.
-#    It forwards to the provider using PROVIDER_API_KEY as a Bearer token.
-#    These are two separate keys — one facing the caller, one facing the
-#    provider.
+# 7. API key auth — openagent-infra validates X-API-Key on every /chat and
+#    /embed request. It forwards to the provider using PROVIDER_API_KEY as a
+#    Bearer token. These are two separate keys — one facing the caller, one
+#    facing the provider.
 #
-# 8. REASONING_EFFORT — both models support configurable reasoning effort.
-#    Default is medium. The proxy injects the effort level into the system
-#    message automatically. openagent-api or any tooling can override per
-#    request (low / medium / high).
+# 8. REASONING_EFFORT — both chat models support configurable reasoning effort
+#    (the embedding model does not reason). Default is medium. The proxy
+#    injects the effort level into the system message automatically.
+#    openagent-api or any tooling can override per request (low / medium / high).
 #
 # Note: the `version` field has been intentionally removed. Modern Docker
 # Compose treats it as obsolete and emits a warning without it.
@@ -56,6 +64,11 @@
 #     -H "X-API-Key: your_api_key_here" \
 #     -d '{"messages": [{"role": "system", "content": "You are OpenAgent..."}, {"role": "user", "content": "hello"}], "reasoning_effort": "medium"}' \
 #     --no-buffer
+#
+#   curl -X POST http://localhost:8002/embed \
+#     -H "Content-Type: application/json" \
+#     -H "X-API-Key: your_api_key_here" \
+#     -d '{"input": ["first chunk", "second chunk"]}'
 # =============================================================================
 
 services:
@@ -66,23 +79,27 @@ services:
   # Runs the FastAPI proxy on port 8002. The only service in this repo.
   #
   # Responsibilities:
-  #   - Validates X-API-Key header on every /chat request (401 if invalid)
-  #   - Validates OpenAI messages format request body
-  #   - Injects reasoning_effort into the system message before forwarding
-  #   - Routes to BASE_MODEL_URL (default) or NERVOUS_SYSTEM_URL based on the
-  #     optional model field
-  #   - Forwards validated requests to the provider via httpx async streaming
-  #     using PROVIDER_API_KEY as the Authorization: Bearer header
-  #   - Streams the SSE response back to the caller
-  #   - /health checks proxy status and both provider endpoints
+  #   - Validates X-API-Key header on every /chat and /embed request (401 if invalid)
+  #   - /chat : validates the OpenAI messages body, injects reasoning_effort
+  #             into the system message, routes to BASE_MODEL_URL (default) or
+  #             NERVOUS_SYSTEM_URL based on the optional model field, and
+  #             streams the SSE response back to the caller
+  #   - /embed: validates the input, forwards to EMBEDDING_MODEL_URL, and
+  #             returns the provider's JSON embeddings response (no streaming)
+  #   - Forwards to the provider via httpx using PROVIDER_API_KEY as the
+  #     Authorization: Bearer header
+  #   - /health checks proxy status and all three provider endpoints
+  #     (base, nervous-system, embedding)
   #
   # Port 8002 is the only externally exposed port here.
   # Port 8001 is reserved for openagent-api; port 8000 for openagent-frontend.
   # Topology: openagent-api (:8001) → openagent-infra (:8002) → BYOC provider
   #
-  # BASE_MODEL_URL in .env must be set to your provider's full
-  # OpenAI-compatible chat-completions endpoint, e.g.:
-  #   https://your-provider.com/v1/chat/completions
+  # BASE_MODEL_URL (and NERVOUS_SYSTEM_URL / EMBEDDING_MODEL_URL) in .env must
+  # be set to your provider's BASE OpenAI-compatible endpoint — the provider
+  # root WITHOUT the path; the proxy appends /v1/chat/completions or
+  # /v1/embeddings when forwarding, e.g.:
+  #   https://your-provider.com/openai
   # ---------------------------------------------------------------------------
   openagent-infra:
     build:
