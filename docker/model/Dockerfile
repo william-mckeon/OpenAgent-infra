@@ -148,7 +148,8 @@ ENV API_KEY="" \
     REASONING_EFFORT="medium" \
     BASE_MODEL_NAME="" \
     NERVOUS_SYSTEM_MODEL_NAME="" \
-    EMBEDDING_MODEL_NAME=""
+    EMBEDDING_MODEL_NAME="" \
+    INFRA_ENABLE_DOCS=""
 
 
 # -----------------------------------------------------------------------------
@@ -184,6 +185,31 @@ RUN pip install --upgrade pip && \
 # .gitignore, etc.) are excluded via .dockerignore at project root.
 # -----------------------------------------------------------------------------
 COPY src/ ./src/
+
+
+# -----------------------------------------------------------------------------
+# Non-root user
+#
+# Create an unprivileged "appuser" and run the proxy as it. The container only
+# runs a Python web app — it needs no root privileges, and dropping root limits
+# the blast radius if the process is ever compromised. /app is chowned so the
+# user can read the source it runs.
+# -----------------------------------------------------------------------------
+RUN useradd --create-home --shell /usr/sbin/nologin appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+
+# -----------------------------------------------------------------------------
+# Healthcheck
+#
+# Hits the proxy's own /health endpoint (no auth required). Uses the stdlib
+# urllib so no extra package (curl/wget) is added to the slim image. Exit 0 =>
+# healthy, non-zero => unhealthy. /health returns 200 whenever the proxy is up,
+# so this checks the proxy itself, not the (possibly cold) provider workers.
+# -----------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health', timeout=4).status == 200 else 1)"]
 
 
 # -----------------------------------------------------------------------------

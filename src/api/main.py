@@ -142,10 +142,11 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from typing import List, Literal, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
@@ -232,6 +233,35 @@ BASE_MODEL_NAME           = os.environ.get("BASE_MODEL_NAME", "")
 NERVOUS_SYSTEM_MODEL_NAME = os.environ.get("NERVOUS_SYSTEM_MODEL_NAME", "")
 EMBEDDING_MODEL_NAME      = os.environ.get("EMBEDDING_MODEL_NAME", "")
 
+# INFRA_ENABLE_DOCS : When "true", expose the FastAPI docs (/docs, /redoc) and
+#                     the OpenAPI schema (/openapi.json). Disabled by default —
+#                     the proxy is an internal, server-to-server service and the
+#                     interactive docs surface the schema and a try-it console
+#                     that nothing internal needs. Set to "true" for local dev.
+ENABLE_DOCS = os.environ.get("INFRA_ENABLE_DOCS", "").strip().lower() == "true"
+
+
+# ---------------------------------------------------------------------------
+# Model routing
+#
+# A /chat request selects a base provider URL by its `model` field. Resolving
+# the URL up front (before the StreamingResponse starts) lets the endpoint
+# return a real 503 when the selected route is unconfigured, instead of an
+# opaque 200 stream carrying an [ERROR] event — mirroring how /embed guards
+# EMBEDDING_MODEL_URL.
+# ---------------------------------------------------------------------------
+def resolve_chat_base_url(model: Literal["base", "nervous_system"]) -> str:
+    """Return the configured BASE provider URL for the selected chat model.
+
+    Raises ValueError on an unexpected model value (defensive — the endpoint
+    already constrains it to {"base", "nervous_system"}).
+    """
+    if model == "base":
+        return BASE_MODEL_URL
+    if model == "nervous_system":
+        return NERVOUS_SYSTEM_URL
+    raise ValueError(f"unexpected model: {model!r}")
+
 
 # ---------------------------------------------------------------------------
 # API key authentication
@@ -272,8 +302,47 @@ async def lifespan(app: FastAPI):
     FastAPI lifespan context manager.
 
     The proxy has no model to load — the provider owns that.
-    Lifespan is used for logging only.
+    Lifespan is used for config validation and logging only.
     """
+    global REASONING_EFFORT
+
+    # Validate the default reasoning effort. This value is injected verbatim
+    # into the system prompt on every /chat request, so an invalid setting
+    # would silently ship a bad instruction to the model. Coerce to medium.
+    if REASONING_EFFORT not in ("low", "medium", "high"):
+        logger.warning(
+            "REASONING_EFFORT=%r is not one of low|medium|high — coercing to 'medium'",
+            REASONING_EFFORT,
+        )
+        REASONING_EFFORT = "medium"
+
+    # Validate the configured provider URLs. Each must use http:// or https://;
+    # a non-https scheme on a non-localhost host sends the provider Bearer key
+    # over the wire in the clear, so warn on it.
+    for label, url in (
+        ("BASE_MODEL_URL", BASE_MODEL_URL),
+        ("NERVOUS_SYSTEM_URL", NERVOUS_SYSTEM_URL),
+        ("EMBEDDING_MODEL_URL", EMBEDDING_MODEL_URL),
+    ):
+        if not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            logger.warning(
+                "%s=%r does not start with http:// or https:// — it will not forward correctly",
+                label,
+                url,
+            )
+            continue
+        if url.startswith("http://"):
+            host = urlparse(url).hostname or ""
+            if host not in ("localhost", "127.0.0.1", "::1"):
+                logger.warning(
+                    "%s uses http:// for non-localhost host %r — the provider key "
+                    "is sent unencrypted; prefer https://",
+                    label,
+                    host,
+                )
+
     logger.info("=== OpenAgent Inference API Starting ===")
     logger.info("Proxy port            : 8002")
     logger.info("Base model endpoint   : %s", BASE_MODEL_URL or "NOT SET")
@@ -283,7 +352,8 @@ async def lifespan(app: FastAPI):
     logger.info("Nervous system name   : %s", NERVOUS_SYSTEM_MODEL_NAME or "(not sent)")
     logger.info("Embedding model name  : %s", EMBEDDING_MODEL_NAME or "(not sent)")
     logger.info("Default reasoning     : %s", REASONING_EFFORT)
-    logger.info("Provider API key      : ...%s", PROVIDER_API_KEY[-4:] if PROVIDER_API_KEY else "NOT SET")
+    logger.info("Provider API key      : %s", "set" if PROVIDER_API_KEY else "NOT SET")
+    logger.info("API docs (/docs)      : %s", "enabled" if ENABLE_DOCS else "disabled")
     logger.info("=== OpenAgent Inference API Ready — listening on :8002 ===")
 
     yield
@@ -294,12 +364,32 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+# Interactive docs and the OpenAPI schema are disabled by default — this proxy
+# is an internal, server-to-server service. Set INFRA_ENABLE_DOCS=true to expose
+# /docs, /redoc, and /openapi.json for local development.
 app = FastAPI(
     title="OpenAgent Inference API",
     description="Model inference proxy — the model serving layer of the OpenAgent system.",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs"          if ENABLE_DOCS else None,
+    redoc_url="/redoc"        if ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
 )
+
+
+# ---------------------------------------------------------------------------
+# Catch-all exception handler
+#
+# Any unhandled exception that reaches here returns a generic JSON 500 rather
+# than leaking a stack trace or framework internals to the caller. HTTPExceptions
+# raised deliberately by the endpoints are handled by FastAPI's own handler and
+# keep their intended status and detail.
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled error on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +507,18 @@ def inject_reasoning_effort(
     """
     result = [{"role": m.role, "content": m.content} for m in messages]
 
-    # Find the system message and append the reasoning instruction
-    for msg in result:
+    # Append the reasoning instruction to the LAST system message — when there
+    # are several, the last one is the closest to the user turn and the one the
+    # model weights most. (A single system message is the common case.)
+    last_system_idx = None
+    for i, msg in enumerate(result):
         if msg["role"] == "system":
-            msg["content"] = f"{msg['content']}\nReasoning: {effort}"
-            return result
+            last_system_idx = i
+
+    if last_system_idx is not None:
+        msg = result[last_system_idx]
+        msg["content"] = f"{msg['content']}\nReasoning: {effort}"
+        return result
 
     # No system message found — prepend one with just the reasoning level
     result.insert(0, {"role": "system", "content": f"Reasoning: {effort}"})
@@ -437,7 +534,7 @@ def inject_reasoning_effort(
 async def proxy_stream(
     messages: List[Message],
     reasoning_effort: str,
-    model: str = "base",
+    model: Literal["base", "nervous_system"] = "base",
 ) -> any:
     """
     Async generator that forwards the chat request to the appropriate
@@ -472,12 +569,15 @@ async def proxy_stream(
     # The matching per-route model name (BASE_MODEL_NAME / NERVOUS_SYSTEM_MODEL_NAME)
     # is selected alongside the URL. Routing is by URL; the name only decides
     # whether a "model" field rides along in the payload (see below).
-    if model == "nervous_system":
+    if model == "base":
+        upstream_base = BASE_MODEL_URL
+        model_name    = BASE_MODEL_NAME
+    elif model == "nervous_system":
         upstream_base = NERVOUS_SYSTEM_URL
         model_name    = NERVOUS_SYSTEM_MODEL_NAME
     else:
-        upstream_base = BASE_MODEL_URL
-        model_name    = BASE_MODEL_NAME
+        # Defensive — the endpoint constrains model to {"base","nervous_system"}.
+        raise ValueError(f"unexpected model: {model!r}")
 
     upstream_url = upstream_base.rstrip("/") + "/v1/chat/completions"
 
@@ -488,7 +588,7 @@ async def proxy_stream(
         payload["model"] = model_name
 
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with httpx.AsyncClient(timeout=600.0, follow_redirects=False) as client:
             async with client.stream(
                 "POST",
                 upstream_url,
@@ -572,7 +672,7 @@ async def proxy_embed(inputs: Union[str, List[str]]) -> httpx.Response:
     if EMBEDDING_MODEL_NAME:
         payload["model"] = EMBEDDING_MODEL_NAME
 
-    async with httpx.AsyncClient(timeout=600.0) as client:
+    async with httpx.AsyncClient(timeout=600.0, follow_redirects=False) as client:
         return await client.post(
             upstream_url,
             json=payload,
@@ -607,11 +707,12 @@ async def probe_endpoint(url: str) -> bool:
         return False
     timeout = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {PROVIDER_API_KEY}"},
-            )
+        # No Authorization header on the liveness probe: this only asks whether
+        # the provider HOST is reachable, which needs no credential. Keeping the
+        # provider key off the probe avoids exposing it on a path that does not
+        # require it. follow_redirects=False so a 3xx is not chased off-host.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resp = await client.get(url)
             return resp.status_code < 500
     except (httpx.ConnectError, httpx.ConnectTimeout):
         # The host itself could not be reached.
@@ -620,7 +721,8 @@ async def probe_endpoint(url: str) -> bool:
         # Connected, but slow to respond — a cold worker spinning up. The host
         # is reachable; the model is just warming.
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning("Health probe of %s failed: %.200s", url, str(exc))
         return False
 
 
@@ -667,12 +769,22 @@ async def chat(
     effort     = request.reasoning_effort or REASONING_EFFORT
     model_name = request.model or "base"
 
+    # Pre-flight: resolve the target base URL for the selected model and fail
+    # with a real 503 if that route is unconfigured. Without this, an empty URL
+    # would build a relative provider URL and surface as an opaque 200 stream
+    # carrying "[ERROR ...]" — mirroring how /embed guards EMBEDDING_MODEL_URL.
+    if not resolve_chat_base_url(model_name):
+        logger.warning("POST /chat for model=%s but its URL is not configured", model_name)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{model_name} model is not configured",
+        )
+
     logger.info(
-        "POST /chat | messages: %d | reasoning: %s | model: %s | api_key: ...%s",
+        "POST /chat | messages: %d | reasoning: %s | model: %s",
         len(request.messages),
         effort,
         model_name,
-        api_key[-4:] if api_key else "none",
     )
 
     return StreamingResponse(
@@ -728,6 +840,13 @@ async def embed(
     else:
         if len(request.input) == 0:
             raise HTTPException(status_code=400, detail="Input list cannot be empty")
+        # Reject a list with any blank/whitespace-only element — same per-element
+        # check as the scalar path, so a batch can't smuggle empty strings past.
+        if any(not item.strip() for item in request.input):
+            raise HTTPException(
+                status_code=400,
+                detail="Input list cannot contain empty strings",
+            )
         input_count = len(request.input)
 
     # Graceful "not configured" — the embedding route is optional, like the
@@ -740,9 +859,8 @@ async def embed(
         )
 
     logger.info(
-        "POST /embed | inputs: %d | api_key: ...%s",
+        "POST /embed | inputs: %d",
         input_count,
-        api_key[-4:] if api_key else "none",
     )
 
     try:

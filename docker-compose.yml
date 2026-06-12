@@ -110,6 +110,10 @@ services:
     env_file:
       - .env
     command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    # Bind only to localhost on the host. Inter-service traffic (openagent-api →
+    # openagent-infra) flows over the compose network by service name and does
+    # NOT use this published port, so binding to 127.0.0.1 keeps the proxy off
+    # any external interface while leaving in-network calls unaffected.
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
     restart: unless-stopped
