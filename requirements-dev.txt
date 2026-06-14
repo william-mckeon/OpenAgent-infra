@@ -1,0 +1,16 @@
+# =============================================================================
+# requirements-dev.txt
+#
+# Development / test-only dependencies for openagent-infra. These are NOT
+# needed to run the proxy in production — production deps live in
+# requirements.txt and are intentionally left untouched.
+#
+# Install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Then run the test suite from the repo root:
+#   python -m pytest tests/ -q
+# =============================================================================
+
+pytest>=8.0,<9.0             # test runner
+pytest-asyncio>=0.23,<1.0    # async test support (verify_api_key is a coroutine)

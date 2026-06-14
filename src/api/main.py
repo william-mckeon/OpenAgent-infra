@@ -139,9 +139,10 @@ Test with curl:
 import asyncio
 import logging
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
-from typing import List, Literal, Optional, Union
+from typing import AsyncGenerator, List, Literal, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -284,7 +285,9 @@ async def verify_api_key(key: str = Security(api_key_header)) -> str:
     Raises 401 if the header is missing or the key does not match API_KEY.
     Returns the key on success. Shared by /chat and /embed.
     """
-    if not key or key != API_KEY:
+    # Constant-time comparison so a timing side-channel cannot be used to
+    # recover the key byte by byte. compare_digest also guards the empty case.
+    if not key or not secrets.compare_digest(key, API_KEY):
         logger.warning("Unauthorized request — invalid or missing API key")
         raise HTTPException(
             status_code=401,
@@ -535,7 +538,7 @@ async def proxy_stream(
     messages: List[Message],
     reasoning_effort: str,
     model: Literal["base", "nervous_system"] = "base",
-) -> any:
+) -> AsyncGenerator[Union[bytes, str], None]:
     """
     Async generator that forwards the chat request to the appropriate
     provider endpoint and yields SSE chunks back to the caller as they arrive.
@@ -543,8 +546,12 @@ async def proxy_stream(
     Routes to the base model by default. Routes to the nervous-system model
     when model="nervous_system" is passed.
 
-    Each line from the provider is forwarded unchanged — no buffering or
-    modification. The final [DONE] event is passed through as-is.
+    The provider's stream is relayed byte-for-byte via aiter_raw(): the raw
+    bytes are yielded exactly as received, with no line-splitting, decoding,
+    re-encoding, or re-framing. This preserves multi-line SSE data fields,
+    comment/keep-alive lines, and the provider's own event boundaries —
+    including the final [DONE] event — exactly as emitted. Only the proxy's
+    own error paths below inject synthetic [ERROR]/[DONE] events (as str).
 
     Parameters
     ----------
@@ -609,17 +616,23 @@ async def proxy_stream(
                     yield "data: [DONE]\n\n"
                     return
 
-                async for line in response.aiter_lines():
-                    if line:
-                        yield f"{line}\n\n"
+                # Byte-for-byte relay. aiter_raw() yields the provider's raw
+                # bytes untouched — no line-splitting/re-framing — so multi-line
+                # data fields and event boundaries survive intact.
+                async for chunk in response.aiter_raw():
+                    if chunk:
+                        yield chunk
 
     except httpx.ConnectError:
         logger.error("Cannot connect to provider at %s", upstream_url)
         yield "data: [ERROR] provider endpoint is not reachable\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:
+        # Log the detail server-side, but never put the raw exception text into
+        # the caller-facing stream — it can contain the upstream provider URL,
+        # which is treated as a secret. Surface a generic message instead.
         logger.error("Proxy stream error: %s", exc)
-        yield f"data: [ERROR] {exc}\n\n"
+        yield "data: [ERROR] internal proxy error\n\n"
         yield "data: [DONE]\n\n"
 
 
@@ -872,8 +885,10 @@ async def embed(
             detail="Embedding provider is not reachable",
         )
     except Exception as exc:
+        # Log the detail server-side, but return a generic message — the raw
+        # exception text can contain the upstream provider URL (a secret).
         logger.error("Embedding proxy error: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Embedding proxy error: {exc}")
+        raise HTTPException(status_code=502, detail="Embedding proxy error")
 
     # Forward a non-200 from the provider as a 502 (the upstream status is
     # logged for the operator). A streaming /chat error can only surface as an

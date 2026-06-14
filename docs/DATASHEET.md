@@ -25,7 +25,7 @@
 | Chat endpoint | `POST /chat` |
 | Embed endpoint | `POST /embed` |
 | Health endpoint | `GET /health` |
-| Docs UI | `GET /docs` |
+| Docs UI | `GET /docs` (disabled by default; set `INFRA_ENABLE_DOCS=true` to enable) |
 | Primary caller | openagent-api (other server-side callers possible as the system grows) |
 | Backend | BYOC provider — any OpenAI-compatible endpoint(s) |
 | Version | 1.0.0 |
@@ -173,7 +173,7 @@ X-API-Key: your_api_key_here
 | `reasoning_effort` | string | No | `low`, `medium`, or `high`. Defaults to the server `REASONING_EFFORT` env var (medium). |
 | `model` | string | No | `base` (default) or `nervous_system`. Routes to the base reasoning model or the control-layer model. Omitting the field always routes to the base model. |
 
-**Important:** the caller is responsible for constructing the full messages list, including the persona as the first `system` message. `openagent-infra` injects `Reasoning: <level>` into that system message automatically before forwarding to the provider — the caller does not need to manage the reasoning instruction. This applies to both the base model and the control-layer model.
+**Important:** the caller is responsible for constructing the full messages list, including the persona as the system message. `openagent-infra` injects `Reasoning: <level>` into the system message (the last system message if more than one is present) automatically before forwarding to the provider — the caller does not need to manage the reasoning instruction. This applies to both the base model and the control-layer model.
 
 #### Reasoning effort guidance
 
@@ -211,7 +211,7 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":
 data: [DONE]
 ```
 
-`openagent-infra` forwards the provider's SSE stream **byte-for-byte** — it does not decode, re-encode, or interpret the chunk JSON on the relay path. Whatever the OpenAI-compatible provider emits is what the caller receives, terminating with the `[DONE]` sentinel.
+`openagent-infra` forwards the provider's SSE stream **byte-for-byte** — the raw bytes are relayed exactly as received, with no line-splitting, decoding, re-encoding, re-framing, or interpretation of the chunk JSON on the relay path. This preserves multi-line `data:` fields, comment/keep-alive lines, and the provider's own event boundaries intact. Whatever the OpenAI-compatible provider emits is what the caller receives, terminating with the `[DONE]` sentinel.
 
 **Important:** The stream always ends with `data: [DONE]`. The caller must watch for this event to know generation is complete.
 
@@ -221,9 +221,11 @@ data: [DONE]
 
 | Status | Condition | Body |
 |---|---|---|
-| `400` | Messages list is empty or contains no user message | `{"detail": "Messages list cannot be empty"}` |
+| `400` | `messages` list is empty | `{"detail": "Messages list cannot be empty"}` |
+| `400` | `messages` contains no `user`-role message | `{"detail": "Messages must include at least one user message"}` |
 | `401` | X-API-Key header missing or invalid | `{"detail": "Invalid or missing API key"}` |
 | `422` | Request body malformed or missing | FastAPI validation error JSON |
+| `503` | Selected `model` route is unconfigured (e.g. `model="nervous_system"` with `NERVOUS_SYSTEM_URL` unset) — returned pre-flight, before the stream begins | `{"detail": "<model> model is not configured"}` |
 
 **Provider-side failures on `/chat` are not HTTP errors.** Once the SSE stream has begun the response is already `HTTP 200`, so a provider that is unreachable or returns a non-200 cannot be reported as an HTTP status. Instead it surfaces as an in-stream event — `data: [ERROR] ...` followed by `data: [DONE]`. The caller must watch the stream for an `[ERROR]` payload, not only the HTTP status. (The `/embed` endpoint, being a single non-streaming response, *does* return real error status codes — see below.)
 
@@ -352,7 +354,7 @@ curl http://localhost:8002/health
 
 ### `GET /docs`
 
-Auto-generated Swagger UI. For interactive testing only.
+Auto-generated Swagger UI. For interactive testing only. **Disabled by default; set `INFRA_ENABLE_DOCS=true` to enable.** When disabled, `/docs`, `/redoc`, and `/openapi.json` are not mounted (the proxy is an internal, server-to-server service).
 
 ```text
 http://localhost:8002/docs
@@ -364,7 +366,7 @@ http://localhost:8002/docs
 
 The system prompt — the persona — is owned by **openagent-api**, not `openagent-infra`. `openagent-api` loads it once at startup and sends it as the first `system` message in the messages list on every `/chat` request.
 
-`openagent-infra` automatically appends `Reasoning: <level>` to that system message before forwarding to the provider — the caller does not include the reasoning instruction manually.
+`openagent-infra` automatically appends `Reasoning: <level>` to the system message (the last system message if more than one is present) before forwarding to the provider — the caller does not include the reasoning instruction manually. In the normal single-system-message case these are the same message.
 
 `openagent-infra` has no knowledge of what the system prompt contains. It receives the full messages list, injects the reasoning level, and forwards. The persona text passes through untouched. The `/embed` route carries no persona — it forwards raw input strings only.
 

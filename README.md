@@ -102,7 +102,7 @@ openagent-api (:8001) → openagent-infra (:8002) → BYOC Provider Base Model  
 
 1. A caller sends `POST /chat` with `X-API-Key`, messages list, optional `reasoning_effort`, and optional `model`.
 2. `openagent-infra` validates the API key — returns `401` if missing or invalid.
-3. `openagent-infra` injects `Reasoning: <level>` into the system message automatically.
+3. `openagent-infra` injects `Reasoning: <level>` into the system message (the last system message if more than one is present) automatically.
 4. `openagent-infra` routes to the correct external endpoint — base model by default, control layer when `model="nervous_system"` — appending `/v1/chat/completions` to the configured base URL.
 5. `openagent-infra` forwards via httpx with `Authorization: Bearer PROVIDER_API_KEY`.
 6. The BYOC provider generates tokens.
@@ -119,7 +119,7 @@ openagent-api (:8001) → openagent-infra (:8002) → BYOC Provider Base Model  
 
 ### System prompt ownership
 
-The system prompt — the persona — is owned upstream by **openagent-api**. `openagent-api` sends it as the first message in the OpenAI messages list on every `/chat` request. `openagent-infra` injects the reasoning effort level into it automatically before forwarding to the compute provider. `openagent-infra` never stores or inspects the system prompt content. The `/embed` route carries no persona — it forwards raw input only.
+The system prompt — the persona — is owned upstream by **openagent-api**. `openagent-api` sends it as the first message in the OpenAI messages list on every `/chat` request. `openagent-infra` injects the reasoning effort level into the system message (the last system message if more than one is present) automatically before forwarding to the compute provider. `openagent-infra` never stores or inspects the system prompt content. The `/embed` route carries no persona — it forwards raw input only.
 
 ---
 
@@ -264,9 +264,11 @@ X-API-Key: your_api_key_here
 | `model` | string | No | `base` (default) or `nervous_system`. Routes to the base endpoint or the control layer endpoint. |
 
 **Error responses:**
-- `400` — messages list is empty or contains no user message
+- `400` — messages list is empty (`{"detail": "Messages list cannot be empty"}`)
+- `400` — messages contain no `user`-role message (`{"detail": "Messages must include at least one user message"}`)
 - `401` — API key missing or invalid
 - `422` — request body malformed
+- `503` — the selected `model` route is unconfigured, e.g. `model="nervous_system"` with `NERVOUS_SYSTEM_URL` unset (`{"detail": "<model> model is not configured"}`); returned pre-flight, before the stream begins
 
 Provider-side failures do **not** surface as an HTTP error: once the stream begins the response is already `HTTP 200`, so an unreachable provider or non-200 is reported as an in-stream `data: [ERROR] ...` event followed by `data: [DONE]`. Watch the stream, not just the status code.
 
@@ -360,7 +362,7 @@ curl http://localhost:8002/health
 
 ### `GET /docs`
 
-Auto-generated Swagger UI:
+Auto-generated Swagger UI. **Disabled by default; set `INFRA_ENABLE_DOCS=true` to enable.** When disabled, `/docs`, `/redoc`, and `/openapi.json` are not mounted (the proxy is an internal, server-to-server service).
 
 ```text
 http://localhost:8002/docs
